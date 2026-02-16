@@ -6,7 +6,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.document_loaders import WebBaseLoader, TextLoader
 from langchain_groq import ChatGroq
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 from typing import List, Any
 
 
@@ -19,7 +19,7 @@ PDF_INPUT_PATH = "fluent_python.pdf"
 TXT_OUTPUT_PATH = "fluent_python.txt"
 
 # --- HELPER FUNCTIONS ---
-#converts the fluent python txtbook in pdf format to taxt format    
+#converts the fluent python txtbook in pdf format to text format    
 def convert_pdf_to_text(pdf_path: str, txt_path: str):
     """Converts a PDF file to a plain text file."""
     try:
@@ -80,11 +80,19 @@ def search_research_db(query: str, collection: chromadb.Collection, embeddings: 
         include=["documents", "distances"]
     )
 
+    docs = results.get("documents") or [[]]
+    dists = results.get("distances") or [[]]
+    doc_list = docs[0] if docs else []
+    dist_list = dists[0] if dists else []
+
     relevant_chunks = []
-    for i, doc in enumerate(results["documents"][0]):
-        similarity = 1 - results["distances"][0][i]
+    for i, doc in enumerate(doc_list):
+        if doc is None:
+            continue
+        dist = dist_list[i] if i < len(dist_list) else 0
+        similarity = 1 - dist if isinstance(dist, (int, float)) else 0
         relevant_chunks.append({
-            "content": doc,
+            "content": doc if isinstance(doc, str) else str(doc),
             "title": "Python Expert Documentation",
             "similarity": similarity
         })
@@ -114,78 +122,39 @@ def answer_research_question(query: str, collection: chromadb.Collection, embedd
     return response.content, relevant_chunks
 
 
-#main function
-def main():
-    print("--- Starting Python Expert Assistant Setup ---")
+def build_research_db():
+    """Load documents, chunk them, embed, and populate the ChromaDB. Run this once before using the app."""
+    print("Building research database...")
+    # Optional: convert PDF to text if the file exists
+    if os.path.exists(PDF_INPUT_PATH):
+        convert_pdf_to_text(PDF_INPUT_PATH, TXT_OUTPUT_PATH)
+    else:
+        print(f"PDF not found at {PDF_INPUT_PATH}, skipping. Using web docs only.")
 
-    # 1. API Key Check
-    if not os.environ.get("GROQ_API_KEY"):
-        print("[ERROR] GROQ_API_KEY environment variable not set. Please set it before running this script.")
-        return
+    documents = load_all_documents()
+    chunks = chunk_documents(documents)
+    embeddings_model = initialize_embeddings(EMBEDDING_MODEL_NAME)
 
-    # 2. Initialize Components
-    embeddings = initialize_embeddings(EMBEDDING_MODEL_NAME)
+    # Embed all chunks (in batches to avoid memory issues)
+    batch_size = 32
+    all_embeddings = []
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i : i + batch_size]
+        texts = [c.page_content for c in batch]
+        all_embeddings.extend(embeddings_model.embed_documents(texts))
+
     client = chromadb.PersistentClient(path=DB_PATH)
-    
-    # This correctly avoids the embedding function error with newer ChromaDB versions
     collection = client.get_or_create_collection(
         name=COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"}
     )
 
-    try:
-        llm = ChatGroq(model=LLM_MODEL_NAME)
-    except Exception as e:
-        print(f"\n[ERROR] Failed to initialize LLM: {e}")
-        return
+    # Add to ChromaDB with ids, documents, and our embeddings
+    ids = [f"chunk_{i}" for i in range(len(chunks))]
+    documents_list = [c.page_content for c in chunks]
+    collection.add(ids=ids, documents=documents_list, embeddings=all_embeddings)
+    print(f"Added {len(chunks)} chunks to '{COLLECTION_NAME}' at {DB_PATH}")
 
-    # 3. INGESTION (Runs only if the database is empty)
-    if collection.count() == 0:
-        print("Database is empty. Starting data ingestion...")
-
-        # A. Convert PDF (Uncomment the line below if you have 'fluent_python.pdf')
-        # convert_pdf_to_text(PDF_INPUT_PATH, TXT_OUTPUT_PATH)
-
-        # B. Load documents
-        all_documents = load_all_documents()
-
-        # C. Chunk the loaded documents
-        all_chunks = chunk_documents(all_documents)
-
-        # D. Store in ChromaDB
-        chunk_contents = [doc.page_content for doc in all_chunks]
-        print(f"Generating embeddings for {len(chunk_contents)} chunks...")
-        chunk_embeddings = embeddings.embed_documents(chunk_contents)
-        ids = [f"doc_{i}" for i in range(len(all_chunks))]
-
-        print("Adding chunks to the database...")
-        collection.add(
-            documents=chunk_contents,
-            embeddings=chunk_embeddings,
-            ids=ids
-        )
-        print(f"Ingestion complete. Total chunks stored: {collection.count()}")
-
-    else:
-        print(f"Database found with {collection.count()} chunks. Skipping ingestion.")
-
-    # 4. INTERACTION (Test Query)
-    print("\n--- RAG System Ready ---")
-    while True:
-        query = input("\nAsk your Python question (or type 'exit' to quit): ")
-        if query.lower() == 'exit':
-            break
-        
-        print(f"\nThinking...")
-        answer, sources = answer_research_question(
-            query, collection, embeddings, llm
-        )
-
-        print("\n--- AI EXPERT ANSWER ---")
-        print(answer)
-        print("\n--- Sources ---")
-        for source in sources:
-            print(f"- {source['title']} (Similarity: {source['similarity']:.4f})")
 
 if __name__ == "__main__":
-    main()
+    build_research_db()
